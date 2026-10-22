@@ -45,12 +45,12 @@
 # the CLI start a missing personal server, because a stopped server ends every
 # session on it and a started one then answers "not found" with authority.
 #
-# Viewport: `rex capture` returns scrollback plus the screen and has no
-# viewport-only mode, so the visible viewport is DERIVED as the last
-# `size.rows` lines of the untrimmed capture. A capture always ends with the
-# full screen grid (blank rows included), and an alternate-screen program's
-# capture is the screen alone, so the derivation holds on both screens; a
-# resize landing between the two reads can skew it by the size difference.
+# Viewport: Rex has no viewport-only read, so the visible viewport is DERIVED
+# as the last `size.rows` lines of the styled `format` read, which always ends
+# with the full screen grid (blank rows included); an alternate-screen
+# program's grid is the screen alone, so the derivation holds on both screens;
+# a resize landing between the two reads can skew it by the size difference.
+# The same read carries the cursor position (fm_backend_rex_screen_read).
 #
 # Requires: rex (the CLI shipped inside the Rex server bundle, which Rex puts
 # on REX_BIN_DIR rather than PATH; see fm_backend_rex_bin) and jq. Bootstrap
@@ -555,23 +555,37 @@ fm_backend_rex_send_text_line() {  # <target> <text> [expected-label]
   return 2
 }
 
-# fm_backend_rex_capture_vt_grid: the whole styled capture, one line per row,
-# carriage returns stripped. The vt format ends with the full screen grid:
-# rows are joined by CRLF and a final LF is added only when the output does
-# not already end in one, so an empty bottom row leaves the output ending in
-# CRLF with that row implicit (verified live). That row is restored here, so
-# the last size.rows lines are exactly the screen. The plain text format is
-# not used for this: it drops trailing blank rows.
-fm_backend_rex_capture_vt_grid() {  # <target>
-  local out
+# fm_backend_rex_screen_read: one styled read of the block's screen and its
+# cursor, from the `format` block method (vt with extra_cursor), which returns
+# the scrollback plus the full screen grid with rows joined by CRLF and then
+# the cursor position as one trailing `ESC[<row>;<col>H` (verified live). An
+# empty bottom row leaves the content ending in CRLF with that row implicit,
+# so a final newline restores it. Sets FM_BACKEND_REX_SCREEN to the derived
+# viewport (the last size.rows rows, SGR kept, carriage returns stripped) and
+# FM_BACKEND_REX_CURSOR_Y to the cursor's 0-based viewport row, empty when the
+# position is absent or outside the viewport. Call it directly, not in a
+# command substitution, so the globals reach the caller.
+fm_backend_rex_screen_read() {  # <target>
+  local rows out cup row
+  FM_BACKEND_REX_SCREEN=
+  FM_BACKEND_REX_CURSOR_Y=
+  rows=$(fm_backend_rex_rows "$1") || return 1
   fm_backend_rex_parse_target "$1" || return 1
-  out=$(fm_backend_rex_read capture -s "$FM_BACKEND_REX_SESSION" -b "$FM_BACKEND_REX_BLOCK" \
-    --format=vt 2>/dev/null && printf x) || return 1
+  out=$(fm_backend_rex_read block call -s "$FM_BACKEND_REX_SESSION" -b "$FM_BACKEND_REX_BLOCK" \
+    format '{"format":"vt","extra_cursor":true}' 2>/dev/null | jq -j '.content // empty' 2>/dev/null && printf x) || return 1
   out=${out%x}
-  case "$out" in
-    *$'\r\n') out="$out"$'\n' ;;
-  esac
-  printf '%s' "$out" | tr -d '\r'
+  [ -n "$out" ] || return 1
+  cup=$(printf '%s' "$out" | LC_ALL=C sed -n '$s/.*\(\[[0-9][0-9]*;[0-9][0-9]*H\)$/\1/p')
+  if [ -n "$cup" ]; then
+    out=${out%$'\033'"$cup"}
+    row=${cup#[}
+    row=${row%%;*}
+    if [ "$row" -ge 1 ] && [ "$row" -le "$rows" ]; then
+      FM_BACKEND_REX_CURSOR_Y=$((row - 1))
+    fi
+  fi
+  FM_BACKEND_REX_SCREEN=$(printf '%s\n' "$out" | tr -d '\r' | tail -n "$rows" && printf x)
+  FM_BACKEND_REX_SCREEN=${FM_BACKEND_REX_SCREEN%x}
 }
 
 # fm_backend_rex_capture: bounded plain-text capture. Rex returns scrollback
@@ -596,13 +610,10 @@ fm_backend_rex_rows() {  # <target>
 }
 
 # fm_backend_rex_visible_capture_vt: the derived viewport (see the header) with
-# SGR styling preserved, so the composer classifier can strip ghost text: the
-# last size.rows rows of the styled capture grid.
+# SGR styling preserved, so the composer classifier can strip ghost text.
 fm_backend_rex_visible_capture_vt() {  # <target>
-  local rows grid
-  rows=$(fm_backend_rex_rows "$1") || return 1
-  grid=$(fm_backend_rex_capture_vt_grid "$1" && printf x) || return 1
-  printf '%s' "${grid%x}" | tail -n "$rows"
+  fm_backend_rex_screen_read "$1" || return 1
+  printf '%s' "$FM_BACKEND_REX_SCREEN"
 }
 
 # fm_backend_rex_visible_capture: the same derived viewport as plain text.
@@ -802,27 +813,48 @@ EOF
   esac
 }
 
-# fm_backend_rex_composer_caps: static capability facts for the shared
-# classifier (bin/fm-composer-lib.sh).
-fm_backend_rex_composer_caps() {
-  printf 'styled=1\ncursor=0\nidentity=1\nrows=%s\n' "${1:-0}"
+# fm_backend_rex_composer_caps: capability facts for the shared classifier
+# (bin/fm-composer-lib.sh); the cursor is declared only when the read
+# reported one.
+fm_backend_rex_composer_caps() {  # <rows> [cursor]
+  printf 'styled=1\ncursor=%s\nidentity=1\nrows=%s\n' "${2:-0}" "${1:-0}"
 }
 
-# fm_backend_rex_composer_state: thin adapter - the styled derived viewport
-# plus capabilities in, the shared verdict out. The whole viewport is read,
-# never a bounded tail, so an overlay drawn below the composer cannot push it
-# out of view. Identity is fetched lazily, only when the verdict depends on it.
-fm_backend_rex_composer_state() {  # <target> [expected-label] -> empty|pending|pending-unproven|unknown
-  local target=$1 cap caps verdict identity
-  cap=$(fm_backend_rex_visible_capture_vt "$target" 2>/dev/null) || { printf 'unknown'; return 0; }
-  caps=$(fm_backend_rex_composer_caps "$(printf '%s\n' "$cap" | wc -l | tr -d '[:space:]')")
-  verdict=$(fm_composer_classify_screen "$caps" "$cap")
+# fm_backend_rex_composer_classify: one shared-classifier verdict for the
+# screen and cursor row (empty for a cursorless read), fetching identity
+# lazily, only when the verdict depends on it.
+fm_backend_rex_composer_classify() {  # <target> <screen> <cursor-row>
+  local target=$1 screen=$2 cy=$3 caps verdict identity
+  caps=$(fm_backend_rex_composer_caps "$(printf '%s\n' "$screen" | wc -l | tr -d '[:space:]')" "${cy:+1}")
+  verdict=$(fm_composer_classify_screen "$caps" "$screen" "$cy")
   if [ "$verdict" = need-identity ]; then
     if ! identity=$(fm_backend_rex_composer_identity "$target" 2>/dev/null) || [ -z "$identity" ]; then
       identity='probe-absent'
     fi
-    verdict=$(fm_composer_classify_screen "$caps" "$cap" '' "$identity")
+    verdict=$(fm_composer_classify_screen "$caps" "$screen" "$cy" "$identity")
     [ "$verdict" != need-identity ] || verdict=unknown
+  fi
+  printf '%s' "$verdict"
+}
+
+# fm_backend_rex_composer_state: thin adapter - the styled derived viewport
+# and the cursor row in, the shared verdict out. The whole viewport is read,
+# never a bounded tail, so an overlay drawn below the composer cannot push it
+# out of view. The cursor-anchored read is tmux's: the shape holding the
+# cursor is the composer, so furniture a harness draws below its composer
+# (OpenCode 1.19's status line) cannot decide the verdict. Where that read is
+# `unknown` - a harness that parks its cursor outside its composer, such as
+# Cursor Agent or Command Code, or no cursor at all - the cursorless read
+# that picks the bottom-most shape decides, exactly as Rex classified every
+# screen before it read the cursor.
+fm_backend_rex_composer_state() {  # <target> [expected-label] -> empty|pending|pending-unproven|unknown
+  local target=$1 verdict=unknown
+  fm_backend_rex_screen_read "$target" 2>/dev/null || { printf 'unknown'; return 0; }
+  if [ -n "$FM_BACKEND_REX_CURSOR_Y" ]; then
+    verdict=$(fm_backend_rex_composer_classify "$target" "$FM_BACKEND_REX_SCREEN" "$FM_BACKEND_REX_CURSOR_Y")
+  fi
+  if [ "$verdict" = unknown ]; then
+    verdict=$(fm_backend_rex_composer_classify "$target" "$FM_BACKEND_REX_SCREEN" '')
   fi
   printf '%s' "$verdict"
 }

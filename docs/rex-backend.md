@@ -66,10 +66,11 @@ Keys map to Rex names (`enter`, `escape`, `tab`, `ctrl+c`, `ctrl+u`); any other 
 Verified submit types the payload once, retries only Enter through the shared composer classifier, and converts still-pending text to success only when the shared queued-Enter policy accepts the trusted native busy state or rendered busy footer.
 
 `capture --trim` returns the scrollback plus the screen as plain text, and the adapter trims the tail locally.
-Rex has no viewport-only capture, so the visible viewport is derived from the styled `--format=vt` capture, which always ends with the full screen grid, blank rows included.
-The vt format joins rows with CRLF and adds a final newline only when the output does not already end in one, so an empty bottom row leaves the output ending in CRLF with that row implicit; the adapter restores it and takes the last `size.rows` rows as the viewport.
-A full-screen program's capture is the screen alone, so the derivation holds on both screens; a resize landing between the size read and the capture can skew it by the size difference.
-The composer classifier reads that styled viewport with styling, row count, and process identity available, and without a cursor position.
+Rex has no viewport-only capture, so the visible viewport is derived from one styled read through the `format` block method (`vt` with `extra_cursor`), which returns the scrollback plus the full screen grid, blank rows included, and then the cursor position as a trailing `ESC[<row>;<col>H`.
+The vt grid joins rows with CRLF, so an empty bottom row leaves the content ending in CRLF with that row implicit; the adapter restores it and takes the last `size.rows` rows as the viewport.
+A full-screen program's grid is the screen alone, so the derivation holds on both screens; a resize landing between the size read and the grid read can skew it by the size difference.
+The composer classifier reads that styled viewport with styling, row count, process identity, and the cursor row available, the same evidence tmux gives it: the shape holding the cursor is the composer, so furniture a harness draws below its composer cannot decide the verdict.
+Where that cursor-anchored read is `unknown`, as for a harness that parks its cursor outside its composer, the cursorless read that takes the bottom-most shape decides instead.
 
 The `process` block method reports the foreground process with its cwd, its ancestors, and the last exit.
 Spawn's worktree discovery reads the foreground cwd, which follows the nested subshell `treehouse get` opens.
@@ -124,7 +125,7 @@ A Rex-hosted Firstmate can run away and quiet supervision: the supervisor target
 These asks to Superlogical are deliberately unfiled, pending a later decision; each line names the Firstmate impact that would go away.
 
 - **Viewport-only capture**: the viewport would be read directly instead of derived from the last `size.rows` rows of a full capture, removing the resize skew.
-- **Cursor position as a JSON field**: the composer classifier would gain the cursor evidence it currently runs without.
+- **Cursor position as a JSON field**: the adapter would stop parsing the cursor out of the trailing escape sequence of the `format` read.
 - **Dropping `working` and `blocked` program-status records when their owner exits**: native busy state could be trusted without cross-checking every record against the live process view.
 - **A documented compatibility floor and machine-readable version output with the API revision**: the version gate would stop parsing `rex version` text.
 - **A per-session or per-block opt-out for the agent hook's automatic session rename**: a harness running in a task tab could not rename the session that holds the captain's or other tasks' tabs.

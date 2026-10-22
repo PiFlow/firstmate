@@ -34,7 +34,7 @@ DEAD_PID=99999999
 # it exit 3 before subscribing.
 make_rex_fake() {  # <dir>
   local dir=$1
-  mkdir -p "$dir/bin" "$dir/fake/process" "$dir/fake/status" "$dir/fake/capture" "$dir/home/state"
+  mkdir -p "$dir/bin" "$dir/fake/process" "$dir/fake/status" "$dir/fake/capture" "$dir/fake/cursor" "$dir/home/state"
   cat >"$dir/bin/rex" <<'SH'
 #!/usr/bin/env bash
 D="${FM_REX_FAKE_DIR:?}"
@@ -143,6 +143,16 @@ case "$cmd:$sub" in
         fi ;;
       program_status)
         if [ -f "$D/status/$u.json" ]; then cat "$D/status/$u.json"; else printf '{"records":[]}\n'; fi ;;
+      format)
+        # The styled grid without the newline `capture` adds when the grid
+        # does not already end in one, then the cursor from fake/cursor/<uuid>
+        # ("<row>;<col>") when extra_cursor is asked for.
+        content=$(cat "$D/capture/$u.vt" 2>/dev/null && printf x); content=${content%x}
+        case "$content" in *$'\r\n') ;; *$'\n') content=${content%$'\n'} ;; esac
+        case "$p1" in
+          *extra_cursor*) [ ! -f "$D/cursor/$u" ] || content="$content"$'\033['"$(cat "$D/cursor/$u")H" ;;
+        esac
+        printf '%s' "$content" | jq -Rs '{content: .}' ;;
       *) exit 2 ;;
     esac ;;
   capture:)
@@ -422,6 +432,40 @@ test_capture_and_derived_viewport() {
   rex_env "$dir" "fm_backend_capture rex '${sid#session:}:00000000-0000-7000-8000-0000000000ff' 5" >/dev/null \
     && fail "capture of a missing block must fail"
   pass "rex capture: CR stripped and tailed; viewport derived from the last size.rows styled rows, implicit empty bottom row restored"
+}
+
+# The real OpenCode 1.19.3 idle screen read through Rex's `format` method,
+# ending in the cursor position Rex appended (row 45 of 50, the composer's
+# input row); below the composer OpenCode draws its status line.
+REX_OPENCODE_FIXTURE="$ROOT/tests/fixtures/rex-opencode-1.19.3/opencode-1.19.3-idle-format.vt"
+
+test_composer_reads_the_cursor_row() {
+  local dir out sid bid t u
+  dir=$(new_case composer-cursor)
+  out=$(rex_env "$dir" 'fm_backend_rex_create_task fm-alpha /tmp')
+  read -r sid _ bid <<<"$out"
+  t="${sid#session:}:${bid#block:}"; u=${bid#block:}
+  python3 - "$REX_OPENCODE_FIXTURE" "$dir/fake/capture/$u.vt" <<'PYFIX'
+import re, sys
+data = open(sys.argv[1], 'rb').read()
+open(sys.argv[2], 'wb').write(re.sub(rb'\x1b\[\d+;\d+H$', b'', data))
+PYFIX
+  printf '45;6' >"$dir/fake/cursor/$u"
+  assert_equals empty "$(rex_env "$dir" "fm_backend_composer_state rex '$t'")" \
+    "an idle OpenCode 1.19.3 composer under the cursor must read empty despite the status line below it"
+  assert_equals 44 "$(rex_env "$dir" "fm_backend_rex_screen_read '$t' && printf %s \"\$FM_BACKEND_REX_CURSOR_Y\"")" \
+    "the cursor row must be 0-based within the derived viewport"
+  rm -f "$dir/fake/cursor/$u"
+  out=$(rex_env "$dir" "fm_backend_composer_state rex '$t'")
+  [ "$out" != empty ] && [ "$out" != pending ] \
+    || fail "the same screen read cursorless must not claim a definite verdict, got $out"
+  printf '99;1' >"$dir/fake/cursor/$u"
+  assert_equals "$out" "$(rex_env "$dir" "fm_backend_composer_state rex '$t'")" \
+    "a cursor outside the viewport must be ignored, falling back to the cursorless read"
+  printf '1;1' >"$dir/fake/cursor/$u"
+  assert_equals "$out" "$(rex_env "$dir" "fm_backend_composer_state rex '$t'")" \
+    "a cursor parked outside any composer must fall back to the cursorless read"
+  pass "fm_backend_composer_state rex: the composer holding the cursor decides; a cursor outside any composer falls back to the cursorless read"
 }
 
 write_process() {  # <dir> <block-id> <json>
@@ -796,6 +840,7 @@ test_create_task_refusals
 test_reclaim_replaces_a_husk_and_refuses_a_live_one
 test_reclaim_fallback_placement_replaces_a_husk
 test_capture_and_derived_viewport
+test_composer_reads_the_cursor_row
 test_agent_state_from_process_view
 test_native_busy_trusts_live_owner_only
 test_current_path_follows_foreground
