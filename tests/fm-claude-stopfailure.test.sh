@@ -265,6 +265,13 @@ test_repeated_failures_keep_rewaking_with_capped_backoff() {
   done
   [ "$(episode_get "$dir" attempts)" = 6 ] || fail "recovery stopped after repeated failures"
   [ "$(alert_count "$dir")" = 2 ] || fail "repeated failures must alert at the rate limit"
+  rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_STOPFAILURE_REALERT_SECS=1)
+  expect_code 2 "$rc" "an expired alert interval must not block the rewake"
+  [ "$(alert_count "$dir")" = 4 ] || fail "successful probes suppressed the expired re-alert"
+  rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_STOPFAILURE_REALERT_SECS=3600)
+  expect_code 2 "$rc" "a rate-limited alert must not block the rewake"
+  [ "$(alert_count "$dir")" = 4 ] || fail "successful probes bypassed the alert rate limit"
+  [ "$(episode_get "$dir" attempts)" = 8 ] || fail "re-alerting changed the retry counter"
   pass "stopfailure: repeated failures keep recovering and alert at the rate limit"
 }
 

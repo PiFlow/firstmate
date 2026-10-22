@@ -210,11 +210,12 @@ fi
 # A Stop by the owning session is a clean turn end, so any API-error episode
 # bin/fm-claude-stopfailure.sh was recovering is over (and its waiting hook
 # stands down on the missing record).
-if [ "$RECOVER_SESSION_LOCK" -eq 0 ]; then
+end_stopfailure_episode() {
   fm_lock_acquire_wait "$STATE/.claude-stopfailure-update.lock"
   rm -f "$STATE/.claude-stopfailure-episode" 2>/dev/null || true
   fm_lock_release "$STATE/.claude-stopfailure-update.lock"
-fi
+}
+[ "$RECOVER_SESSION_LOCK" -eq 1 ] || end_stopfailure_episode
 
 # --- AFK: the away daemon owns the watcher and triage; never rewake ----------
 [ -e "$STATE/.afk" ] && exit 0
@@ -232,6 +233,7 @@ need_supervision || exit 0
 if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
   "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || exit 0
   fm_session_lock_owned_by_self "$STATE" || exit 0
+  end_stopfailure_episode
 fi
 
 # --- single-flight generation claim --------------------------------------------

@@ -294,10 +294,11 @@ test_stop_ends_a_stopfailure_episode_only_for_the_owning_session() {
   : > "$dir/state/task.meta"
   write_arm_fixture "$dir" clean
   printf 'session=sess-autoarm\nfirst=1\nattempts=2\nalerted=0\ngen=3\n' > "$dir/state/.claude-stopfailure-episode"
-  "$FAKE_CLAUDE" -c 'sleep 5' &
+  "$FAKE_CLAUDE" -c 'while :; do sleep 1; done' &
   local holder=$!
   printf '%s\n' "$holder" > "$dir/state/.lock"
   printf '%s\n' '{"session_id":"sess-foreign"}' | FM_HOME="$dir" "$dir/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>&1
+  kill -0 "$holder" 2>/dev/null || fail "foreign harness exited before the ownership check completed"
   kill "$holder" 2>/dev/null || true
   [ -e "$dir/state/.claude-stopfailure-episode" ] || fail "a Stop by a session that does not own the lock ended another session's episode"
   pass "auto-arm: a Stop ends the StopFailure episode only for the owning session"
@@ -334,6 +335,7 @@ test_reclaims_stale_session_lock_before_arming() {
   dir=$(make_primary_dir "$TMP_ROOT/stale-lock")
   : > "$dir/state/task.meta"
   printf '9999999\n' > "$dir/state/.lock"
+  printf 'session=stale\nfirst=1\nattempts=2\nalerted=0\ngen=3\n' > "$dir/state/.claude-stopfailure-episode"
   write_arm_fixture "$dir" actionable
   out=$(printf '%s\n' '{"session_id":"stale"}' \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
@@ -345,6 +347,7 @@ test_reclaims_stale_session_lock_before_arming() {
   actual_owner=$(cat "$dir/state/.lock")
   [ "$actual_owner" = "$expected_owner" ] || fail "stale session lock was not claimed by the current harness: expected $expected_owner, got $actual_owner"
   [ -e "$dir/state/arm-ran" ] || fail "hook did not arm after reclaiming the stale session lock"
+  [ ! -e "$dir/state/.claude-stopfailure-episode" ] || fail "reclaimed owner left the StopFailure episode open"
   [ "$(epoch_outcome "$dir")" = rewake ] || fail "stale-lock recovery must record outcome=rewake"
   pass "auto-arm: a demonstrably dead recorded session owner is reclaimed through fm-lock.sh before arming"
 }

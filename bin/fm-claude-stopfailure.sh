@@ -359,6 +359,7 @@ while :; do
   [ $(( $(date +%s) - START )) -lt "$MAX_WAIT" ] || exit 0
   if api_reachable; then
     still_needed || exit 0
+    [ "$(episode_get alerted)" = 0 ] || raise_alert "automatic resumes continue to end in API errors"
     episode_update || exit 0
     log "rewake: API reachable after error=$ERROR_TYPE (rewake $ATTEMPTS)"
     {
