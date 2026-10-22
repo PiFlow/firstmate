@@ -1,0 +1,18 @@
+ok - stopfailure: inert in a linked child worktree even when in-flight
+ok - stopfailure: an idle home exits silently
+ok - stopfailure: inert under AFK and without session-lock ownership
+ok - stopfailure: stands down for Cursor and pi-code payloads
+ok - stopfailure: any argument is a manual run and never recovers
+ok - stopfailure: a reachable API rewakes once, counts it, and does not alert
+ok - stopfailure: waits for the reachability probe, then rewakes without alerting
+ok - stopfailure: an unrecovered episode publishes downtime, alerts each channel once, then still rewakes
+ok - stopfailure: a dead API alerts once (rate-limited) and never rewakes
+ok - stopfailure: authentication failures alert immediately instead of rewaking
+ok - stopfailure: repeated failures keep recovering and alert at the rate limit
+ok - stopfailure: original deadline alerts unless Stop ends the episode
+ok - stopfailure: deadline runs independently of slow successful and failed probes
+ok - stopfailure: trusted session identity preserves the deadline across helper replacement
+ok - stopfailure: stale locks at entry and during recovery are reclaimed
+ok - stopfailure: a clean Stop ends the episode and the waiting hook stands down
+ok - stopfailure: a newer StopFailure supersedes a waiting hook, so only one rewake is delivered
+ok - stopfailure: an episode record from another session never affects a new one
