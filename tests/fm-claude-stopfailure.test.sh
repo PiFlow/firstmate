@@ -78,12 +78,15 @@ run_sf() {  # <dir> [payload]
     | FM_HOME="$dir" FM_WEDGE_ALARM_LOG="$dir/alerts.log" \
       FM_STOPFAILURE_PROBE_CMD="$(cat "$dir/probe.cmd" 2>/dev/null || echo true)" \
       "${@:3}" "$FAKE_CLAUDE" -c '
+        export CLAUDE_PID=$$ CLAUDE_CODE_SESSION_ID=sess-sf
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+        printf "%s\n" "$CLAUDE_CODE_SESSION_ID" > "$FM_HOME/state/.lock-session"
         "$FM_HOME/bin/fm-claude-stopfailure.sh"
         result=$?
         case "${FM_TEST_CANCEL:-}" in
           stop) rm -f "$FM_HOME/state/.claude-stopfailure-episode" ;;
-          newer) sed "s/^gen=.*/gen=99/" "$FM_HOME/state/.claude-stopfailure-episode" > "$FM_HOME/state/new-episode"; mv "$FM_HOME/state/new-episode" "$FM_HOME/state/.claude-stopfailure-episode" ;;
+          need) rm -f "$FM_HOME/state/task.meta" ;;
+          foreign) printf "other-session\n" > "$FM_HOME/state/.lock-session" ;;
         esac
         sleep "${FM_TEST_HOLD:-0}"
         exit "$result"
@@ -273,14 +276,61 @@ test_rewake_preserves_the_original_alert_deadline() {
   expect_code 2 "$rc" "reachable API must rewake"
   [ "$(alert_count "$dir")" = 2 ] || fail "rewake without a watcher must alert at the original deadline"
   local cancel
-  for cancel in stop newer; do
+  for cancel in stop need foreign; do
     dir=$(make_home "$TMP_ROOT/deadline-$cancel")
     write_probe "$dir" up
     rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_TEST_HOLD=5 FM_TEST_CANCEL="$cancel")
     expect_code 2 "$rc" "reachable API must rewake before cancellation"
-    [ "$(alert_count "$dir")" = 0 ] || fail "$cancel must supersede the detached deadline"
+    [ "$(alert_count "$dir")" = 0 ] || fail "$cancel must make the detached deadline a no-op"
   done
-  pass "stopfailure: original deadline alerts unless Stop or a newer firing supersedes it"
+  pass "stopfailure: original deadline alerts unless Stop ends the episode"
+}
+
+test_deadline_runs_during_a_slow_probe() {
+  local dir outcome pid waited
+  for outcome in true false; do
+    dir=$(make_home "$TMP_ROOT/slow-$outcome")
+    printf 'touch "%s/state/probe-start"; sleep 6; touch "%s/state/probe-end"; %s' "$dir" "$dir" "$outcome" > "$dir/probe.cmd"
+    ( run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_STOPFAILURE_MAX_WAIT=9 > "$dir/rc" ) &
+    pid=$!
+    waited=0
+    until [ "$(alert_count "$dir")" = 2 ] || [ "$waited" -ge 50 ]; do sleep 0.1; waited=$((waited + 1)); done
+    [ "$(alert_count "$dir")" = 2 ] || fail "deadline did not alert during slow $outcome probe"
+    [ -e "$dir/state/probe-start" ] || fail "probe never started"
+    [ ! -e "$dir/state/probe-end" ] || fail "alert waited for slow $outcome probe to finish"
+    wait "$pid" || true
+    [ "$(alert_count "$dir")" = 2 ] || fail "probe completion duplicated the deadline alert"
+  done
+  pass "stopfailure: deadline runs independently of slow successful and failed probes"
+}
+
+test_deadline_survives_model_helper_replacement() {
+  local dir
+  dir=$(make_home "$TMP_ROOT/helper-replacement")
+  cat > "$dir/first.sh" <<'HELPER'
+export CLAUDE_PID=$$
+"$FM_HOME/bin/fm-lock.sh" >/dev/null
+printf '%s\n' "$$" > "$FM_HOME/first-helper"
+printf '%s\n' "$TEST_PAYLOAD" | "$FM_HOME/bin/fm-claude-stopfailure.sh"
+printf '%s\n' "$?" > "$FM_HOME/rc"
+HELPER
+  cat > "$dir/second.sh" <<'HELPER'
+export CLAUDE_PID=$$
+"$FM_HOME/bin/fm-lock.sh" >/dev/null
+printf '%s\n' "$$" > "$FM_HOME/second-helper"
+sleep 6
+HELPER
+  FM_HOME="$dir" FM_WEDGE_ALARM_LOG="$dir/alerts.log" \
+    FM_STOPFAILURE_PROBE_CMD=true FM_GUARD_GRACE=4 TEST_PAYLOAD="$PAYLOAD_DEFAULT" \
+    CLAUDE_CODE_SESSION_ID=sess-sf "$FAKE_CLAUDE" -c '
+      "$FAKE_CLAUDE" "$FM_HOME/first.sh"
+      "$FAKE_CLAUDE" "$FM_HOME/second.sh"
+    ' > "$dir/out" 2>&1
+  expect_code 2 "$(cat "$dir/rc")" "first helper must rewake"
+  [ "$(cat "$dir/first-helper")" != "$(cat "$dir/second-helper")" ] || fail "helper identity did not change"
+  [ "$(cat "$dir/state/.lock")" = "$(cat "$dir/second-helper")" ] || fail "replacement did not reclaim the lock"
+  [ "$(alert_count "$dir")" = 2 ] || fail "helper replacement cancelled the deadline"
+  pass "stopfailure: trusted session identity preserves the deadline across helper replacement"
 }
 
 test_reclaims_stale_lock_at_entry_and_during_wait() {
@@ -368,6 +418,8 @@ test_never_recovering_api_alerts_and_stands_down_without_rewaking
 test_credential_failure_alerts_at_once_without_a_rewake
 test_repeated_failures_keep_rewaking_with_capped_backoff
 test_rewake_preserves_the_original_alert_deadline
+test_deadline_runs_during_a_slow_probe
+test_deadline_survives_model_helper_replacement
 test_reclaims_stale_lock_at_entry_and_during_wait
 test_clean_stop_ends_the_episode_and_a_waiting_hook_stands_down
 test_newer_failure_supersedes_the_waiting_hook

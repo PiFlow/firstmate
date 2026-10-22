@@ -45,7 +45,9 @@
 #   FM_STOPFAILURE_BACKOFF_BASE    first backoff in seconds (default 10)
 #   FM_STOPFAILURE_BACKOFF_CAP     longest backoff in seconds (default 300)
 #   FM_STOPFAILURE_MAX_WAIT        seconds one firing waits before standing down,
-#                                  below the registered hook timeout (default 28000)
+#                                  below the registered hook timeout (default 28000);
+#                                  after an unrecovered wait the alert has fired
+#                                  and the session waits for a human message
 #   FM_STOPFAILURE_REALERT_SECS    minimum seconds between alerts (default 3600)
 #   FM_STOPFAILURE_PROBE_CMD       reachability seam: a shell command whose exit 0
 #                                  means the API is reachable (default: curl
@@ -143,6 +145,10 @@ ensure_session_owner() {
   fm_session_lock_owned_by_self "$STATE"
 }
 ensure_session_owner || exit 0
+TRUSTED_SESSION=$(fm_session_lock_trusted_session_id 2>/dev/null || true)
+SESSION_PID=$(cat "$STATE/.lock" 2>/dev/null || true)
+DEADLINE_CHECK=0
+EPISODE_LOCK="$STATE/.claude-stopfailure-update.lock"
 if fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
   exit 0
 fi
@@ -191,6 +197,7 @@ episode_write() {  # <first> <attempts> <alerted> <gen>
   return 1
 }
 
+fm_lock_acquire_wait "$EPISODE_LOCK"
 FIRST=$NOW
 ATTEMPTS=0
 ALERTED=0
@@ -206,12 +213,15 @@ if [ -f "$EPISODE" ] && [ "$(episode_get session)" = "$SESSION_KEY" ]; then
   esac
 fi
 MY_GEN=$((GEN + 1))
-episode_write "$FIRST" "$ATTEMPTS" "$ALERTED" "$MY_GEN" || exit 0
+episode_write "$FIRST" "$ATTEMPTS" "$ALERTED" "$MY_GEN" || { fm_lock_release "$EPISODE_LOCK"; exit 0; }
+fm_lock_release "$EPISODE_LOCK"
 
 # True while this firing still owns the episode: the record exists with this
 # generation (a clean Stop removes it, a newer StopFailure replaces it).
 still_owner() {
-  [ "$(episode_get gen)" = "$MY_GEN" ] && [ "$(episode_get session)" = "$SESSION_KEY" ]
+  [ "$(episode_get session)" = "$SESSION_KEY" ] || return 1
+  [ "$(episode_get first)" = "$FIRST" ] || return 1
+  [ "$DEADLINE_CHECK" -eq 1 ] || [ "$(episode_get gen)" = "$MY_GEN" ]
 }
 
 # True while this firing should keep working: the same conditions the gates above
@@ -219,30 +229,54 @@ still_owner() {
 still_needed() {
   still_owner || return 1
   [ ! -e "$STATE/.afk" ] || return 1
-  ensure_session_owner || return 1
+  if [ "$DEADLINE_CHECK" -eq 1 ]; then
+    if [ -n "$TRUSTED_SESSION" ]; then
+      [ "$(fm_session_lock_recorded_session_id "$STATE")" = "$TRUSTED_SESSION" ] || return 1
+    else
+      [ "$(cat "$STATE/.lock" 2>/dev/null)" = "$SESSION_PID" ] || return 1
+    fi
+  else
+    ensure_session_owner || return 1
+  fi
   fm_supervision_needed "$STATE" "$GRACE" || return 1
   ! fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"
 }
 
 # Rewrite the episode with new counters, only while this firing still owns it.
-episode_update() {  # <attempts> <alerted>
-  still_owner || return 1
-  ATTEMPTS=$1
-  ALERTED=$2
-  episode_write "$FIRST" "$ATTEMPTS" "$ALERTED" "$MY_GEN"
+episode_update() {
+  local status=1
+  fm_lock_acquire_wait "$EPISODE_LOCK"
+  if still_owner; then
+    ATTEMPTS=$(( $(episode_get attempts) + 1 ))
+    ALERTED=$(episode_get alerted)
+    episode_write "$FIRST" "$ATTEMPTS" "$ALERTED" "$MY_GEN" && status=0
+  fi
+  fm_lock_release "$EPISODE_LOCK"
+  return "$status"
 }
 
 # --- alert ----------------------------------------------------------------------
 raise_alert() {  # <reason>
   local reason=$1 now summary marker="$STATE/.watcher-down"
-  now=$(date +%s)
-  # Same typed downtime episode a watcher close publishes, so the next drain and
-  # session start present WATCHER DOWN; best-effort, the alert does not depend on it.
-  fm_recovery_marker_publish "$marker" downtime >/dev/null 2>&1 || true
-  if [ "$ALERTED" -gt 0 ] && [ $((now - ALERTED)) -lt "$REALERT_SECS" ]; then
+  fm_lock_acquire_wait "$EPISODE_LOCK"
+  if ! still_needed; then
+    fm_lock_release "$EPISODE_LOCK"
     return 0
   fi
-  episode_update "$ATTEMPTS" "$now" || return 0
+  now=$(date +%s)
+  ATTEMPTS=$(episode_get attempts)
+  ALERTED=$(episode_get alerted)
+  if [ "$ALERTED" -gt 0 ] && { [ "$DEADLINE_CHECK" -eq 1 ] || [ $((now - ALERTED)) -lt "$REALERT_SECS" ]; }; then
+    fm_lock_release "$EPISODE_LOCK"
+    return 0
+  fi
+  if ! episode_write "$FIRST" "$ATTEMPTS" "$now" "$(episode_get gen)"; then
+    fm_lock_release "$EPISODE_LOCK"
+    return 0
+  fi
+  ALERTED=$now
+  fm_lock_release "$EPISODE_LOCK"
+  fm_recovery_marker_publish "$marker" downtime >/dev/null 2>&1 || true
   log "alert: $reason (error=$ERROR_TYPE attempts=$ATTEMPTS)"
   summary="A Claude turn ended on an API error ($ERROR_TYPE) and firstmate supervision is OFF: $reason. Queued wakes are preserved; open the session to resume."
   wedge_alarm_notify "$summary" "$marker"
@@ -253,8 +287,7 @@ raise_alert() {  # <reason>
 # response below 500 proves the endpoint answers (a 4xx for a bare GET is the
 # normal reply); no response, a timeout, or a 5xx does not. A provider whose
 # endpoint this hook cannot name (Bedrock, Vertex, Foundry), or a host without
-# curl, cannot be probed, so it counts as reachable and the bounded backoff and
-# backoff alone paces recovery.
+# curl, cannot be probed, so it counts as reachable and bounded backoff paces recovery.
 api_reachable() {
   local base code
   if [ -n "${FM_STOPFAILURE_PROBE_CMD:-}" ]; then
@@ -303,49 +336,39 @@ nap_until() {
   done
 }
 
-while :; do
-  # The alert deadline is the episode's FM_GUARD_GRACE, not this firing's wait.
-  ALERT_AT=$((FIRST + GRACE))
-  WAKE_AT=$(( $(date +%s) + DELAY ))
-  if [ "$ALERTED" -eq 0 ] && [ "$ALERT_AT" -lt "$WAKE_AT" ]; then
-    nap_until "$ALERT_AT" || exit 0
+if [ "$GEN" -eq 0 ] && [ "$ALERTED" -eq 0 ]; then
+  (
+    trap '' HUP
+    DEADLINE_CHECK=1
+    ALERT_AT=$((FIRST + GRACE))
+    while :; do
+      still_owner || exit 0
+      remaining=$((ALERT_AT - $(date +%s)))
+      [ "$remaining" -gt 0 ] || break
+      [ "$remaining" -le 5 ] || remaining=5
+      sleep "$remaining"
+    done
     raise_alert "the session did not recover within ${GRACE}s of the API error"
-    still_needed || exit 0
-    WAKE_AT=$(( $(date +%s) + DELAY ))
-    [ "$WAKE_AT" -gt "$ALERT_AT" ] || WAKE_AT=$ALERT_AT
-  fi
+  ) </dev/null >/dev/null 2>&1 &
+  disown "$!"
+fi
+
+while :; do
+  WAKE_AT=$(( $(date +%s) + DELAY ))
   nap_until "$WAKE_AT" || exit 0
   [ $(( $(date +%s) - START )) -lt "$MAX_WAIT" ] || exit 0
-  if [ "$(date +%s)" -ge "$ALERT_AT" ]; then
-    raise_alert "the session did not recover within ${GRACE}s of the API error"
-  fi
   if api_reachable; then
     still_needed || exit 0
-    episode_update $((ATTEMPTS + 1)) "$ALERTED" || exit 0
+    episode_update || exit 0
     log "rewake: API reachable after error=$ERROR_TYPE (rewake $ATTEMPTS)"
     {
       printf 'firstmate Claude turn ended on an API error (%s) while supervision was needed, and the API answers again - this wake resumes the home.\n' "$ERROR_TYPE"
       printf 'Run bin/fm-wake-drain.sh first, handle every queued wake, then run its exact WAKE_ACK_REQUIRED --ack-through command. This turn ending arms the next needed cycle through the Stop hook - do NOT run bin/fm-watch-arm.sh.\n'
     } >&2
-    if [ "$ALERTED" -eq 0 ]; then
-      if [ "$(date +%s)" -ge "$ALERT_AT" ]; then
-        raise_alert "the session did not recover within ${GRACE}s of the API error"
-      else
-        DEADLINE_ANCESTRY=$(fm_harness_ancestry_pids) || exit 0
-        (
-          trap '' HUP
-          fm_harness_ancestry_pids() { printf '%s\n' "$DEADLINE_ANCESTRY"; }
-          nap_until "$ALERT_AT" || exit 0
-          still_needed || exit 0
-          raise_alert "the session did not recover within ${GRACE}s of the API error"
-        ) </dev/null >/dev/null 2>&1 &
-        disown "$!"
-      fi
-    fi
     exit 2
   fi
   # Still down: keep the captain informed at the rate limit, then back off.
-  [ "$ALERTED" -eq 0 ] || raise_alert "the API is still unreachable"
+  [ "$(episode_get alerted)" = 0 ] || raise_alert "the API is still unreachable"
   DELAY=$((DELAY * 2))
   [ "$DELAY" -le "$BACKOFF_CAP" ] || DELAY=$BACKOFF_CAP
 done

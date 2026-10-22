@@ -136,12 +136,14 @@ Its header owns the exact thresholds and tunables.
   The rewake handling turn drains the queue, and its ordinary `Stop` re-arms through the auto-arm, which stays the only arm owner.
   A provider whose endpoint the hook cannot name, or a host without `curl`, counts as reachable, so the capped backoff paces recovery.
 - Backoff: `state/.claude-stopfailure-episode` counts the rewakes delivered since the last clean Stop, doubling the backoff each time.
-  Backoff grows up to its cap; failed handling turns never exhaust recovery.
+  Backoff grows up to its cap; failed handling turns do not exhaust a rewake count budget.
+  After a firing reaches its maximum wait without recovery, the alert has fired and the session waits for a human message.
   A clean Stop by the owning session removes the record, which ends the episode and makes a still-waiting hook stand down, and a newer `StopFailure` supersedes an older waiting one.
 - Alert: an episode that has gone `FM_GUARD_GRACE` seconds without a clean Stop, or whose error needs a human (`authentication_failed`, `billing_error`), publishes the typed `downtime` recovery episode above and raises one active alert through the [`config/wedge-alarm`](wedge-alarm.md) channels, repeated at most once per `FM_STOPFAILURE_REALERT_SECS`.
   The next drain then presents WATCHER DOWN.
   So within `FM_GUARD_GRACE` of an eligible `StopFailure`, either a live identity-matched watcher with an independently viable owner exists or the captain receives the active alert.
-  A rewake before that deadline leaves an alert-only check until the original deadline; a clean Stop or newer StopFailure supersedes it.
+  One alert-only check starts with the episode and enforces its original deadline independently of probes and retry generations.
+  A clean Stop ends that episode; a healthy watcher or vanished need makes the check a no-op.
 
 ### Supervision host
 
