@@ -77,7 +77,7 @@ Spawn's worktree discovery reads the foreground cwd, which follows the nested su
 Agent state is recovery-grade: a verified harness anywhere in the foreground process or its ancestors reads `alive`, a shell foreground with no harness above it reads `dead`, an exited terminal child reads `dead`, anything else reads `ambiguous`, a structured not-found reads `missing`, and an unreachable server reads `unreadable`.
 Passive reads never start a server.
 
-Rex records Program Status Protocol (OSC 7501) reports per block, and Claude Code and Grok report `working`, `idle`, and `done` there today.
+Rex records Program Status Protocol (OSC 7501) reports per block; Claude Code, Codex, Grok, and Muse report there today, while OpenCode, Pi, and Devin do not ([verification](verification/runtime-backends.md#worker-tools-on-rex)).
 A record counts only while the process that reported it is the foreground process or one of its ancestors, because without shell integration a `working` record outlives the command that reported it.
 That native state is positive busy evidence only, exactly like Herdr's, so the harness's own lifecycle stays the busy authority.
 
@@ -117,7 +117,7 @@ A Rex-hosted Firstmate can run away and quiet supervision: the supervisor target
 - Sessions do not survive a Rex server stop; recovery proves such tasks gone and reclaims them into fresh tabs.
 - The viewport is derived, not read directly, as described above.
 - Only harnesses that report OSC 7501 contribute native busy evidence; the others are classified from their own lifecycle and rendered footer.
-- Command Code is refused on Rex until it is live-verified there.
+- Command Code is refused on Rex until it is live-verified there, and Cursor Agent is not yet live-verified on Rex.
 - There is no Rex CI lane; the real-server tests run where a Rex server is already up.
 
 ## Deferred upstream asks
@@ -138,6 +138,7 @@ These asks to Superlogical are deliberately unfiled, pending a later decision; e
 tests/fm-backend-rex.test.sh
 tests/fm-backend-rex-smoke.test.sh
 tests/fm-backend-rex-eventwait-smoke.test.sh
+FM_REX_COMPOSER_LIVE=1 tests/fm-backend-rex-composer-live-e2e.test.sh
 ```
 
 The real-server tests run only against an already-running server, work only in `fm-test-` sessions they create and kill by exact id, refuse through a forwarding guard any state-changing call outside those sessions, and check that every other session is byte-identical before and after ([`tests/rex-test-safety.sh`](../tests/rex-test-safety.sh)).
