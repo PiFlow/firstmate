@@ -80,6 +80,22 @@ Rex records Program Status Protocol (OSC 7501) reports per block, and Claude Cod
 A record counts only while the process that reported it is the foreground process or one of its ancestors, because without shell integration a `working` record outlives the command that reported it.
 That native state is positive busy evidence only, exactly like Herdr's, so the harness's own lifecycle stays the busy authority.
 
+## Push events
+
+While the watcher waits between polls, a Rex home runs one bounded `rex do` reader ([`bin/backends/rex-eventwait.lua`](../bin/backends/rex-eventwait.lua)) on the session holding its task tabs, listening only to those tasks' blocks.
+The reader subscribes first and the current program status of each block is reconciled after, so a block that went `blocked` between waits is reported once and an edge during the reconcile is not lost.
+A `blocked` program status reaches the supervisor within a fraction of a second instead of waiting for the stale-pane timer.
+It counts only when the process that reported it passes the same foreground-chain rule as native busy state, and its wake reason carries Rex's blocked kind (`permission`, `question`, or `auth`) and the program's message, cut at 160 characters.
+[`bin/fm-transition-lib.sh`](../bin/fm-transition-lib.sh) owns the policy and the per-block dedupe: one wake per `blocked` edge, cleared by the next `working` edge or by the task's cleanup.
+The watcher skips secondmate endpoints, declared waits, and captain-held work exactly as it does for Herdr's push path.
+
+When a watched block's program exits or the block closes, the wait ends at once so the watcher's next poll reconciles that task immediately.
+That never wakes the supervisor by itself, because a routine cleanup closes blocks too.
+
+The push path only shortens latency, and polling stays the fallback.
+Supervision polls when the CLI or server is below API revision 5 or unreachable (the reader never starts a server), when the reader cannot start or ends before its deadline, and for the rest of the watcher's life after three consecutive reader failures.
+Task tabs in a second Rex session stay on polling, because one reader covers one session.
+
 ## Cleanup and the absence proof
 
 Cleanup closes only the task's block, which closes its tab, and then proves it gone: only an exact not-found after the close counts, so a close that failed or left the block alive keeps the task's records.
@@ -101,7 +117,6 @@ A Rex-hosted Firstmate can run away and quiet supervision: the supervisor target
 - The viewport is derived, not read directly, as described above.
 - Only harnesses that report OSC 7501 contribute native busy evidence; the others are classified from their own lifecycle and rendered footer.
 - Command Code is refused on Rex until it is live-verified there.
-- Push events are not wired yet, so supervision polls Rex like a backend without a push stream.
 - There is no Rex CI lane; the real-server tests run where a Rex server is already up.
 
 ## Deferred upstream asks
@@ -121,7 +136,8 @@ These asks to Superlogical are deliberately unfiled, pending a later decision; e
 ```sh
 tests/fm-backend-rex.test.sh
 tests/fm-backend-rex-smoke.test.sh
+tests/fm-backend-rex-eventwait-smoke.test.sh
 ```
 
-The smoke test runs only against an already-running server, works only in an `fm-test-` session it creates and kills by exact id, refuses through a forwarding guard any state-changing call outside that session, and checks that every other session is byte-identical before and after.
+The real-server tests run only against an already-running server, work only in `fm-test-` sessions they create and kill by exact id, refuse through a forwarding guard any state-changing call outside those sessions, and check that every other session is byte-identical before and after ([`tests/rex-test-safety.sh`](../tests/rex-test-safety.sh)).
 [`verification/runtime-backends.md`](verification/runtime-backends.md#rex) records the live evidence.

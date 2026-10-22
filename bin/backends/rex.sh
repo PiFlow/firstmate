@@ -68,6 +68,8 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$FM_BACKEND_REX_ROOT/bin/fm-composer-lib.sh"
 # shellcheck source=bin/fm-agent-process-lib.sh
 . "$FM_BACKEND_REX_ROOT/bin/fm-agent-process-lib.sh"
+# shellcheck source=bin/fm-transition-lib.sh
+. "$FM_BACKEND_REX_ROOT/bin/fm-transition-lib.sh"
 
 # Verified floor: the API revision the live verification ran against.
 FM_BACKEND_REX_MIN_API=5
@@ -141,12 +143,13 @@ fm_backend_rex_failure_class() {  # <rc> <stderr> -> missing|unreachable|error
 }
 
 # fm_backend_rex_version_check: refuse a missing CLI, or a CLI or server below
-# the verified API revision. The server read may start a missing personal
-# server; it runs only on the spawn path.
-fm_backend_rex_version_check() {
-  local raw client_api status server_api
+# the verified API revision. With `start` (the default, spawn path only) the
+# server read may start a missing personal server; with `read` it never does.
+fm_backend_rex_version_check() {  # [start|read]
+  local raw client_api status server_api call=fm_backend_rex_cli
+  [ "${1:-start}" != read ] || call=fm_backend_rex_read
   fm_backend_rex_tool_check || return 1
-  raw=$(fm_backend_rex_cli version 2>/dev/null) || {
+  raw=$("$call" version 2>/dev/null) || {
     echo "error: 'rex version' failed; is Rex installed correctly?" >&2
     return 1
   }
@@ -161,7 +164,7 @@ fm_backend_rex_version_check() {
     echo "error: the rex CLI speaks API revision $client_api, older than the verified minimum $FM_BACKEND_REX_MIN_API; update Rex before using backend=rex" >&2
     return 1
   fi
-  status=$(fm_backend_rex_cli api call server.status 2>/dev/null) || {
+  status=$("$call" api call server.status 2>/dev/null) || {
     echo "error: the Rex server could not be reached or started ('rex api call server.status' failed); see docs/rex-backend.md 'Setup'" >&2
     return 1
   }
@@ -697,25 +700,46 @@ EOF
   esac
 }
 
-# fm_backend_rex_native_state: the block's OSC 7501 program state
-# (working|blocked|idle|done|error), or empty when no record can be trusted.
-# A record is trusted only while its reporting process is the foreground
-# process or one of its ancestors: without shell integration a `working`
-# record outlives the command that reported it (verified live), so no
-# self-report outranks the process view.
-fm_backend_rex_native_state() {  # <target>
-  local status process
+# fm_backend_rex_live_pids: the block's foreground pid and its ancestors' pids
+# as a JSON array, from the process view; fails when the block cannot be read.
+fm_backend_rex_live_pids() {  # <target>
+  fm_backend_rex_process_chain "$1" || return 1
+  printf '%s\n' "$FM_BACKEND_REX_CHAIN" | cut -f2 \
+    | jq -Rsc 'split("\n") | map(select(test("^[0-9]+$")) | tonumber)' 2>/dev/null
+}
+
+# fm_backend_rex_owner_trusted: THE trust rule for an OSC 7501 record. A record
+# counts only while its reporting process is the block's foreground process or
+# one of its ancestors: without shell integration a `working` record outlives
+# the command that reported it (verified live), so no self-report outranks the
+# process view.
+fm_backend_rex_owner_trusted() {  # <target> <owner-pid>
+  local live
+  case "$2" in ''|*[!0-9]*) return 1 ;; esac
+  live=$(fm_backend_rex_live_pids "$1") || return 1
+  jq -en --argjson live "$live" --argjson pid "$2" '$live | index($pid) != null' >/dev/null 2>&1
+}
+
+# fm_backend_rex_trusted_record: the block's governing trusted OSC 7501 record
+# as "<state>\t<kind>\t<app>\t<msg>" (working, then blocked, error, done,
+# idle), or nothing when no record passes fm_backend_rex_owner_trusted.
+fm_backend_rex_trusted_record() {  # <target>
+  local status live
   status=$(fm_backend_rex_block_call "$1" program_status) || return 0
-  process=$(fm_backend_rex_block_call "$1" process) || return 0
-  jq -rn --argjson s "$status" --argjson p "$process" '
-    ([$p.foreground.pid?, ($p.ancestors[]?.pid)] | map(select(. != null))) as $live
-    | [$s.records[]? | select(.owner.pid != null and ([.owner.pid] | inside($live))) | .state] as $states
-    | if ($states | index("working")) then "working"
-      elif ($states | index("blocked")) then "blocked"
-      elif ($states | index("error")) then "error"
-      elif ($states | index("done")) then "done"
-      elif ($states | index("idle")) then "idle"
-      else empty end' 2>/dev/null || true
+  live=$(fm_backend_rex_live_pids "$1") || return 0
+  jq -rn --argjson s "$status" --argjson live "$live" '
+    def clean: tostring | gsub("[\t\r\n]"; " ");
+    [$s.records[]? | select(.owner.pid as $p | $p != null and ($live | index($p)) != null)] as $trusted
+    | first(("working", "blocked", "error", "done", "idle") as $want
+        | $trusted[] | select(.state == $want)
+        | [.state, (.kind // ""), (.app // ""), (.msg // "")] | map(clean) | join("\t"))
+    // empty' 2>/dev/null || true
+}
+
+# fm_backend_rex_native_state: the state of the block's trusted OSC 7501 record
+# (working|blocked|idle|done|error), or empty when none can be trusted.
+fm_backend_rex_native_state() {  # <target>
+  fm_backend_rex_trusted_record "$1" | cut -f1
 }
 
 # fm_backend_rex_busy_state: busy|idle|unknown from the trusted native state.
@@ -944,4 +968,184 @@ fm_backend_rex_list_live() {
   done <<EOF
 $(printf '%s' "$list" | jq -r '.sessions[]?.session_id' 2>/dev/null)
 EOF
+}
+
+# --- native event push: program_status_changed reader ------------------------
+#
+# The Rex half of the immediate blocked-state escalation, mirroring the herdr
+# subscriber. fm_backend_rex_wait_transition replaces the watcher's blind sleep
+# with a bounded `rex do` Lua reader (bin/backends/rex-eventwait.lua) that
+# streams program_status_changed, child_exited, and block_closed for the
+# watched blocks. Every edge is normalized through fm_transition_record and
+# routed through the shared policy and dedupe (bin/fm-transition-lib.sh); a
+# status edge counts only when fm_backend_rex_owner_trusted accepts its owner.
+# Polling stays the permanent fallback: an incapable Rex, a reader that cannot
+# start, or one that ends early all return 2 and the caller sleeps the budget.
+
+# Per-pane escalation dedupe marker prefix, under the state dir
+# (bin/fm-transition-lib.sh owns the dedupe contract).
+FM_BACKEND_REX_ESCALATED_PREFIX=".rex-escalated-"
+# Longest OSC 7501 message carried into a wake reason; the rest is cut.
+FM_BACKEND_REX_DETAIL_MAX=${FM_BACKEND_REX_DETAIL_MAX:-160}
+
+# fm_backend_rex_events_capable: the push path's gate - the CLI and jq present
+# and both the CLI and the running server at the verified API revision, read
+# without starting a server. FM_BACKEND_REX_EVENTS_FORCE overrides the verdict
+# for tests (1 = capable, 0 = incapable).
+fm_backend_rex_events_capable() {  # <session>
+  case "${FM_BACKEND_REX_EVENTS_FORCE:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  fm_backend_rex_version_check read >/dev/null 2>&1
+}
+
+# fm_backend_rex_event_reader: run the bounded Lua reader for <session-id> and
+# the watched <block-id...> until <timeout> seconds pass. Exits 0 at the
+# deadline; nonzero when the reader cannot start. FM_BACKEND_REX_EVENT_READER
+# substitutes a whitespace-split command taking the same arguments, so tests
+# can replay canned stream lines.
+fm_backend_rex_event_reader() {  # <session-id> <timeout> <block-id...>
+  local sid=$1 timeout=$2 word blocks
+  shift 2
+  if [ -n "${FM_BACKEND_REX_EVENT_READER:-}" ]; then
+    local cmd=()
+    for word in $FM_BACKEND_REX_EVENT_READER; do
+      cmd+=("$word")
+    done
+    "${cmd[@]}" "$sid" "$timeout" "$@"
+    return
+  fi
+  blocks=$(printf '%s\n' "$@" | jq -Rsc '{blocks: split("\n") | map(select(length > 0))}') || return 1
+  fm_backend_rex_read 'do' -s "$sid" --for "${timeout}s" \
+    "$FM_BACKEND_REX_ROOT/bin/backends/rex-eventwait.lua" --args "$blocks"
+}
+
+# fm_backend_rex_edge_detail: the human-readable cause of a blocked edge, from
+# Rex's blocked kind (permission|question|auth) and the program's message.
+fm_backend_rex_edge_detail() {  # <kind> <msg>
+  local kind=$1 msg=$2
+  if [ "${#msg}" -gt "$FM_BACKEND_REX_DETAIL_MAX" ]; then
+    msg="${msg:0:$FM_BACKEND_REX_DETAIL_MAX}..."
+  fi
+  if [ -n "$kind" ] && [ -n "$msg" ]; then
+    printf '%s: %s' "$kind" "$msg"
+  else
+    printf '%s' "$kind$msg"
+  fi
+}
+
+fm_backend_rex_commit_transition() {  # <state_dir> <session> <record>
+  fm_transition_commit "$1" "$FM_BACKEND_REX_ESCALATED_PREFIX" "$2" "$3"
+}
+
+fm_backend_rex_clear_transition() {  # <state_dir> <window>
+  fm_transition_clear "$1" "$FM_BACKEND_REX_ESCALATED_PREFIX" "$2"
+}
+
+# fm_backend_rex_wait_transition: the bounded event wait. <session> is the
+# recorded session uuid and each <window> a recorded
+# "<session-uuid>:<block-uuid>" target. Blocks up to <timeout_secs> for a fresh
+# trusted `blocked` edge on a watched block, then prints its normalized record
+# (the block uuid as pane_id, Rex's app as agent, kind and message as detail)
+# and returns 0. Returns 1 on a clean full-budget wait, and also at once when a
+# watched block's program exits or the block closes, so the watcher's poll
+# cycle reconciles that task now. Returns 2 when the event path is unusable or
+# the reader ended early (the caller sleeps the budget itself).
+fm_backend_rex_wait_transition() {  # <session> <timeout_secs> <state_dir> <window...>
+  local session=$1 timeout=$2 state=$3
+  shift 3
+  local w sid='' blocks=() windows=()
+  case "$timeout" in ''|*[!0-9]*|0) return 2 ;; esac
+  for w in "$@"; do
+    fm_backend_rex_parse_target "$w" || continue
+    [ "${FM_BACKEND_REX_SESSION#session:}" = "$session" ] || continue
+    sid=$FM_BACKEND_REX_SESSION
+    blocks+=("$FM_BACKEND_REX_BLOCK")
+    windows+=("$w")
+  done
+  [ "${#blocks[@]}" -gt 0 ] || return 2
+  if [ "${FM_BACKEND_EVENTS_CAPABILITY_CONFIRMED:-0}" != 1 ]; then
+    fm_backend_rex_events_capable "$session" || return 2
+  fi
+
+  local fifo_dir fifo reader_pid line block to kind app owner msg record hit apply_rc
+  local rc=1 reader_rc=0 started=$SECONDS level
+  fifo_dir=$(mktemp -d "${TMPDIR:-/tmp}/fm-rex-eventwait.XXXXXX") || return 2
+  fifo="$fifo_dir/events"
+  if ! mkfifo "$fifo" 2>/dev/null; then
+    rm -rf "$fifo_dir" 2>/dev/null || true
+    return 2
+  fi
+  fm_backend_rex_event_reader "$sid" "$timeout" "${blocks[@]}" > "$fifo" 2>/dev/null &
+  reader_pid=$!
+  if ! exec 9< "$fifo"; then
+    kill "$reader_pid" 2>/dev/null || true
+    wait "$reader_pid" 2>/dev/null || true
+    rm -rf "$fifo_dir" 2>/dev/null || true
+    return 2
+  fi
+  if ! IFS= read -r -t "$((timeout + 15))" -u 9 line || [ "$line" != "@subscribed" ]; then
+    rc=2
+  fi
+
+  # Level reconcile once the reader is listening: a block already blocked
+  # since the last wait is returned now, once, and a working one clears its
+  # marker, while newer edges queue in the live stream.
+  if [ "$rc" -eq 1 ]; then
+    for w in "${windows[@]}"; do
+      level=$(fm_backend_rex_trusted_record "$w")
+      [ -n "$level" ] || continue
+      to=$(printf '%s' "$level" | cut -f1)
+      kind=$(printf '%s' "$level" | cut -f2)
+      app=$(printf '%s' "$level" | cut -f3)
+      msg=$(printf '%s' "$level" | cut -f4)
+      record=$(fm_transition_record "${w#*:}" "" "" "$to" "$app" "$(fm_backend_rex_edge_detail "$kind" "$msg")")
+      if hit=$(fm_transition_apply "$state" "$FM_BACKEND_REX_ESCALATED_PREFIX" "$session" "$record"); then
+        printf '%s' "$hit"
+        rc=0
+        break
+      fi
+    done
+  fi
+
+  # Drain stream edges until a fresh blocked edge, an endpoint-gone edge, or
+  # the deadline. Fields are split with cut, not `IFS=$'\t' read`, which would
+  # collapse an empty middle field.
+  while [ "$rc" -eq 1 ] && IFS= read -r line <&9; do
+    [ -n "$line" ] || continue
+    block=$(printf '%s' "$line" | cut -f1)
+    to=$(printf '%s' "$line" | cut -f2)
+    kind=$(printf '%s' "$line" | cut -f3)
+    app=$(printf '%s' "$line" | cut -f4)
+    owner=$(printf '%s' "$line" | cut -f5)
+    msg=$(printf '%s' "$line" | cut -f6)
+    fm_backend_rex_id_valid block "$block" || continue
+    case "$(fm_transition_policy "$to")" in
+      actionable|absorb)
+        fm_backend_rex_owner_trusted "$session:${block#block:}" "$owner" || continue
+        ;;
+    esac
+    record=$(fm_transition_record "${block#block:}" "" "" "$to" "$app" "$(fm_backend_rex_edge_detail "$kind" "$msg")")
+    apply_rc=0
+    hit=$(fm_transition_apply "$state" "$FM_BACKEND_REX_ESCALATED_PREFIX" "$session" "$record") || apply_rc=$?
+    case "$apply_rc" in
+      0) printf '%s' "$hit"; rc=0 ;;
+      3) rc=3 ;;
+    esac
+  done
+  [ "$rc" -eq 1 ] || kill "$reader_pid" 2>/dev/null || true
+  wait "$reader_pid" 2>/dev/null || reader_rc=$?
+  exec 9<&-
+  rm -rf "$fifo_dir" 2>/dev/null || true
+  case "$rc" in
+    0) return 0 ;;
+    2) return 2 ;;
+    3) return 1 ;;
+  esac
+  # No edge: a reader that ran the whole budget is a clean wait; one that
+  # failed or ended early (its session destroyed) is not, so the caller
+  # sleeps rather than spinning.
+  [ "$reader_rc" -eq 0 ] && [ $((SECONDS - started)) -ge $((timeout - 1)) ] && return 1
+  return 2
 }

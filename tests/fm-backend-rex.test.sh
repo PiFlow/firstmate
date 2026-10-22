@@ -29,6 +29,9 @@ DEAD_PID=99999999
 # fresh server with no sessions), `ls-fail`, `close-noop` (a close that leaves
 # the block alive). Per-block canned reads live in fake/process/<uuid>.json,
 # fake/status/<uuid>.json, fake/capture/<uuid>.txt and fake/capture/<uuid>.vt.
+# `do` stands in for the bounded event reader: it prints "@subscribed", then
+# replays fake/events (a `sleep N` line pauses), and exits 0; `do-fail` makes
+# it exit 3 before subscribing.
 make_rex_fake() {  # <dir>
   local dir=$1
   mkdir -p "$dir/bin" "$dir/fake/process" "$dir/fake/status" "$dir/fake/capture" "$dir/home/state"
@@ -154,6 +157,18 @@ case "$cmd:$sub" in
     has_block "$sid" "$bid" || notfound "block"
     case "$p0" in enter|escape|tab|ctrl+c|ctrl+u) ;; *) exit 2 ;; esac
     printf '%s\n' "$p0" >>"$D/keys" ;;
+  do:)
+    has_session "$sid" || notfound "session"
+    [ ! -f "$D/do-fail" ] || exit 3
+    echo "@subscribed"
+    if [ -f "$D/events" ]; then
+      while IFS= read -r line; do
+        case "$line" in
+          "sleep "*) sleep "${line#sleep }" ;;
+          *) printf '%s\n' "$line" ;;
+        esac
+      done <"$D/events"
+    fi ;;
   kill:)
     has_session "$p0" || notfound "session"
     save --arg s "$p0" '.sessions |= map(select(.session_id != $s))' ;;
@@ -495,6 +510,127 @@ test_send_literal_and_keys() {
   pass "rex input: literal text after --, no call for empty input, verified key names only, line submit"
 }
 
+# --- push events -------------------------------------------------------------
+
+# rex_event: one reader line for a status edge on <block-id>.
+rex_event() {  # <block-id> <state> <kind> <app> <owner-pid> <msg>
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$@"
+}
+
+# push_case: a task tab whose foreground is a harness at pid 4242 under a shell
+# at 4000; sets PUSH_DIR, PUSH_SID (bare), PUSH_BID (prefixed), and PUSH_T.
+push_case() {  # <name>
+  local out sid
+  PUSH_DIR=$(new_case "$1")
+  out=$(rex_env "$PUSH_DIR" 'fm_backend_rex_create_task fm-alpha /tmp')
+  read -r sid _ PUSH_BID <<<"$out"
+  PUSH_SID=${sid#session:}
+  PUSH_T="$PUSH_SID:${PUSH_BID#block:}"
+  write_process "$PUSH_DIR" "$PUSH_BID" '{"foreground":{"pid":4242,"name":"claude"},"ancestors":[{"pid":4000,"name":"zsh"}],"last_exit":null}'
+}
+
+# push_wait: run the dispatcher's wait with <timeout>; prints "<rc>|<record>".
+push_wait() {  # <timeout> [VAR=value...]
+  local timeout=$1
+  shift
+  rex_env "$PUSH_DIR" "$@" "out=\$(fm_backend_wait_transition rex '$PUSH_SID' $timeout \"\$STATE\" '$PUSH_T'); printf '%s|%s' \"\$?\" \"\$out\""
+}
+
+test_push_capability_gate() {
+  local dir
+  dir=$(new_case push-cap)
+  rex_env "$dir" 'fm_backend_has_push rex' || fail "rex must report a push stream"
+  rex_env "$dir" 'fm_backend_events_capable rex abc' || fail "API revision 5 must be events-capable"
+  rex_env "$dir" FM_REX_FAKE_SERVER_API=4 'fm_backend_events_capable rex abc' && fail "a server below revision 5 must not be events-capable"
+  touch "$dir/fake/down"
+  rex_env "$dir" 'fm_backend_events_capable rex abc' && fail "a stopped server must not be events-capable"
+  [ -f "$dir/fake/down" ] || fail "the capability probe must never start a server"
+  pass "fm_backend_events_capable rex: API revision 5 on both ends, read without starting a server"
+}
+
+test_push_blocked_edge_carries_kind_and_message() {
+  local res rec
+  push_case push-edge
+  rex_event "$PUSH_BID" working "" claude-code 4242 "" >"$PUSH_DIR/fake/events"
+  rex_event "$PUSH_BID" blocked permission claude-code 4242 "Allow Bash: rm -rf build" >>"$PUSH_DIR/fake/events"
+  res=$(push_wait 5)
+  [ "${res%%|*}" = 0 ] || fail "a trusted blocked edge must return 0, got $res"
+  rec=${res#*|}
+  assert_equals "${PUSH_BID#block:}" "$(rex_env "$PUSH_DIR" "fm_transition_pane_id '$rec'")" "pane_id must be the block uuid"
+  assert_equals blocked "$(rex_env "$PUSH_DIR" "fm_transition_to_status '$rec'")" "to_status must be blocked"
+  assert_equals claude-code "$(rex_env "$PUSH_DIR" "fm_transition_agent '$rec'")" "agent must be Rex's app"
+  assert_equals "permission: Allow Bash: rm -rf build" "$(rex_env "$PUSH_DIR" "fm_transition_detail '$rec'")" "detail must carry the kind and message"
+  grep -qE "^rex --autostart=false do -s session:$PUSH_SID .*rex-eventwait.lua --args \{\"blocks\":\[\"$PUSH_BID\"\]\}$" "$PUSH_DIR/fake/log" \
+    || fail "the reader must run scoped to the recorded session with the watched block, never starting a server:"$'\n'"$(grep ' do ' "$PUSH_DIR/fake/log")"
+  pass "fm_backend_wait_transition rex: a trusted blocked edge returns its record with Rex's app, kind, and message"
+}
+
+test_push_untrusted_owner_is_ignored() {
+  local res
+  push_case push-untrusted
+  rex_event "$PUSH_BID" blocked question claude-code 777 "stale" >"$PUSH_DIR/fake/events"
+  res=$(push_wait 1)
+  assert_equals "1|" "$res" "a blocked edge whose owner is not in the foreground chain must be ignored"
+  rex_event "$PUSH_BID" blocked question claude-code 4000 "Continue?" >"$PUSH_DIR/fake/events"
+  res=$(push_wait 1)
+  [ "${res%%|*}" = 0 ] || fail "a blocked edge from an ancestor owner must count, got $res"
+  pass "fm_backend_wait_transition rex: a blocked edge counts only while its owner is the foreground process or an ancestor"
+}
+
+test_push_level_reconcile_and_dedupe() {
+  local res rec
+  push_case push-level
+  printf '{"records":[{"state":"blocked","kind":"auth","app":"grok-build","msg":"Sign in","owner":{"pid":4242}}]}\n' \
+    >"$PUSH_DIR/fake/status/${PUSH_BID#block:}.json"
+  res=$(push_wait 1)
+  [ "${res%%|*}" = 0 ] || fail "a block already blocked must be returned by the level reconcile, got $res"
+  rec=${res#*|}
+  assert_equals "auth: Sign in" "$(rex_env "$PUSH_DIR" "fm_transition_detail '$rec'")" "the reconciled record must carry the kind and message"
+  rex_env "$PUSH_DIR" "fm_backend_commit_transition rex \"\$STATE\" '$PUSH_SID' '$rec'" || fail "commit failed"
+  res=$(push_wait 1)
+  assert_equals "1|" "$res" "a committed blocked block must not be re-delivered"
+  rex_event "$PUSH_BID" working "" grok-build 4242 "" >"$PUSH_DIR/fake/events"
+  rex_event "$PUSH_BID" blocked question grok-build 4242 "Pick one" >>"$PUSH_DIR/fake/events"
+  res=$(push_wait 5)
+  [ "${res%%|*}" = 0 ] || fail "a working edge must clear the marker so the next blocked edge escalates, got $res"
+  rex_env "$PUSH_DIR" "fm_backend_commit_transition rex \"\$STATE\" '$PUSH_SID' '${res#*|}'"
+  rex_env "$PUSH_DIR" "fm_backend_clear_transition rex \"\$STATE\" '$PUSH_T'"
+  : >"$PUSH_DIR/fake/events"
+  res=$(push_wait 1)
+  [ "${res%%|*}" = 0 ] || fail "cleanup's clear must let a still-blocked block escalate again, got $res"
+  pass "fm_backend_wait_transition rex: level reconcile returns a blocked block once; working and cleanup clear the marker"
+}
+
+test_push_gone_edge_ends_the_wait() {
+  local res start
+  push_case push-gone
+  { rex_event "$PUSH_BID" gone "" "" "" "block closed"; echo "sleep 4"; } >"$PUSH_DIR/fake/events"
+  start=$SECONDS
+  res=$(push_wait 6)
+  assert_equals "1|" "$res" "an endpoint-gone edge must end the wait with 1 and no record"
+  [ $((SECONDS - start)) -lt 4 ] || fail "an endpoint-gone edge must end the wait at once"
+  rex_event "block:00000000-0000-7000-8000-00000000ffff" gone "" "" "" "block closed" >"$PUSH_DIR/fake/events"
+  res=$(push_wait 1)
+  assert_equals "1|" "$res" "a gone edge for an unwatched block is a plain clean wait"
+  pass "fm_backend_wait_transition rex: a watched block's exit or close ends the wait at once for an immediate poll"
+}
+
+test_push_reader_failures_fall_back() {
+  local res
+  push_case push-fail
+  touch "$PUSH_DIR/fake/do-fail"
+  res=$(push_wait 1)
+  assert_equals "2|" "$res" "a reader that cannot subscribe must return 2"
+  rm -f "$PUSH_DIR/fake/do-fail"
+  res=$(push_wait 5)
+  assert_equals "2|" "$res" "a reader that ends well before the deadline must return 2, not a clean wait"
+  res=$(rex_env "$PUSH_DIR" "fm_backend_wait_transition rex '$PUSH_SID' 1 \"\$STATE\" 'not-a-target'; echo \$?")
+  assert_equals 2 "$res" "no watchable window must return 2"
+  res=$(rex_env "$PUSH_DIR" "fm_backend_wait_transition rex '$PUSH_SID' 1 \"\$STATE\" '00000000-0000-7000-8000-00000000aaaa:${PUSH_BID#block:}'; echo \$?")
+  assert_equals 2 "$res" "a window in another session must not be watched by this reader"
+  pass "fm_backend_wait_transition rex: a reader that cannot start or ends early falls back to polling"
+}
+
 # --- cleanup and absence proof ----------------------------------------------
 
 test_kill_closes_and_retires_per_home_session() {
@@ -671,3 +807,9 @@ test_absence_recheck
 test_control_absence_verdict_reads_rex_meta
 test_control_exit_after_a_server_stop
 test_list_live_scopes_to_this_home
+test_push_capability_gate
+test_push_blocked_edge_carries_kind_and_message
+test_push_untrusted_owner_is_ignored
+test_push_level_reconcile_and_dedupe
+test_push_gone_edge_ends_the_wait
+test_push_reader_failures_fall_back
