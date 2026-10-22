@@ -20,7 +20,7 @@ wedge_alarm_log() {
 }
 
 # --- backend-independent active wedge alert ---------------------------------
-# The tmux status-line flash in inject_wedge_alarm below is a cosmetic,
+# The tmux status-line flash in fm-supervise-daemon.sh's inject_wedge_alarm is a cosmetic,
 # client-side OSD with no cross-backend equivalent, so a wedged non-tmux primary
 # (the 2026-07-10 overnight incident: a claude-on-herdr primary) got NO active
 # signal - only the passive state/.subsuper-inject-wedged marker, which nothing

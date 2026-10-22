@@ -124,7 +124,7 @@ The Claude turn-end guard owns that notice commit contract, the monotonic failur
 ### Claude API-error turn ends
 
 Claude runs `StopFailure` instead of `Stop` when a turn ends in an API error (overloaded, rate limit, DNS failure, connection refused, the machine sleeping mid-response).
-The Stop hooks never run for that turn, so when it was the handling turn of an actionable wake there is no re-arm, no turn-end guard, and no alarm until a human types (issue #2940).
+The Stop hooks never run for that turn, so the StopFailure path must recover supervision or alert independently of them (issue #2940).
 `.claude/settings.json` therefore registers `bin/fm-claude-stopfailure.sh` as a `StopFailure` `asyncRewake` hook with the same `timeout: 28800` as the auto-arm.
 Claude delivers that hook's exit 2 to an idle session even though its hooks reference calls `StopFailure` output ignored; [`verification/supervision.md`](verification/supervision.md#stopfailure-asyncrewake-wakes-an-idle-session-2026-10-22) records the measurement.
 
