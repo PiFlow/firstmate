@@ -185,14 +185,8 @@ fm_hook_payload_is_foreign_host "$PAYLOAD" && exit 0
 # arm would run SYNCHRONOUSLY inside Pi's turn end, holding that turn open for
 # the declared multi-hour timeout - the same wedge as Cursor above (issue
 # #3343). Pi's own native extensions own Pi supervision, so stand down on a
-# pi-code-delivered payload. The signal is again the PAYLOAD, not the
-# environment: pi-code stamps every hook payload's transcript_path with Pi's
-# own session file under .pi/, which a Claude transcript path never contains.
-# Fail direction matches the guard above: no payload, no jq, or no
-# transcript_path means the hook RUNS.
-if [ -n "$PAYLOAD" ] && command -v jq >/dev/null 2>&1; then
-  printf '%s' "$PAYLOAD" | jq -e '(.transcript_path // "") | type == "string" and contains("/.pi/")' >/dev/null 2>&1 && exit 0
-fi
+# pi-code-delivered payload (fm_hook_payload_is_pi_code owns the signal).
+fm_hook_payload_is_pi_code "$PAYLOAD" && exit 0
 
 # --- scope: genuine primary checkout only -----------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
@@ -212,6 +206,11 @@ if ! fm_session_lock_owned_by_self "$STATE"; then
   fm_harness_pid_alive "$LOCK_PID" && exit 0
   RECOVER_SESSION_LOCK=1
 fi
+
+# A Stop by the owning session is a clean turn end, so any API-error episode
+# bin/fm-claude-stopfailure.sh was recovering is over (and its waiting hook
+# stands down on the missing record).
+[ "$RECOVER_SESSION_LOCK" -eq 1 ] || rm -f "$STATE/.claude-stopfailure-episode" 2>/dev/null || true
 
 # --- AFK: the away daemon owns the watcher and triage; never rewake ----------
 [ -e "$STATE/.afk" ] && exit 0

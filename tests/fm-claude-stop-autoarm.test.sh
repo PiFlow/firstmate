@@ -280,6 +280,29 @@ record_watcher_lock() {
 
 # --- scope and gates ----------------------------------------------------------
 
+test_stop_ends_a_stopfailure_episode_only_for_the_owning_session() {
+  local dir out status
+  dir=$(make_primary_dir "$TMP_ROOT/stopfailure-episode-owner")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" clean
+  printf 'session=sess-autoarm\nfirst=1\nattempts=2\nalerted=0\ngen=3\n' > "$dir/state/.claude-stopfailure-episode"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  [ -e "$dir/state/arm-ran" ] || fail "the owning session's Stop did not reach the arm"
+  [ ! -e "$dir/state/.claude-stopfailure-episode" ] || fail "a clean Stop by the owning session left the API-error episode open"
+
+  dir=$(make_primary_dir "$TMP_ROOT/stopfailure-episode-foreign")
+  : > "$dir/state/task.meta"
+  write_arm_fixture "$dir" clean
+  printf 'session=sess-autoarm\nfirst=1\nattempts=2\nalerted=0\ngen=3\n' > "$dir/state/.claude-stopfailure-episode"
+  "$FAKE_CLAUDE" -c 'sleep 5' &
+  local holder=$!
+  printf '%s\n' "$holder" > "$dir/state/.lock"
+  printf '%s\n' '{"session_id":"sess-foreign"}' | FM_HOME="$dir" "$dir/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>&1
+  kill "$holder" 2>/dev/null || true
+  [ -e "$dir/state/.claude-stopfailure-episode" ] || fail "a Stop by a session that does not own the lock ended another session's episode"
+  pass "auto-arm: a Stop ends the StopFailure episode only for the owning session"
+}
+
 test_inert_in_child_worktree() {
   local base dir out status
   base="$TMP_ROOT/crew-base"
@@ -2049,3 +2072,4 @@ test_host_crash_is_retried_then_reported
 test_arguments_never_arm
 test_fm_lock_status_still_works_with_shared_lib
 test_stands_down_only_on_pi_code_transcript_path
+test_stop_ends_a_stopfailure_episode_only_for_the_owning_session
