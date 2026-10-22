@@ -2710,7 +2710,6 @@ FM_GUARD_GRACE=300      # beacon freshness threshold for guard verdicts, arm hea
 FM_CLAUDE_AUTOARM_ATTEMPTS=2   # bounded Stop-owned arm attempts per Claude auto-arm cycle; accepted values are 1, 2, or 3
 FM_STOPFAILURE_BACKOFF_BASE=10     # seconds before the Claude StopFailure hook's first reachability probe; doubles per rewake in an episode
 FM_STOPFAILURE_BACKOFF_CAP=300     # longest StopFailure backoff in seconds
-FM_STOPFAILURE_MAX_REWAKES=5       # rewakes per API-error episode before the hook only alerts
 FM_STOPFAILURE_MAX_WAIT=28000      # seconds one StopFailure firing waits for the API before standing down; stays below the registered hook timeout
 FM_STOPFAILURE_REALERT_SECS=3600   # minimum seconds between StopFailure active alerts in one episode
 FM_STOPFAILURE_PROBE_CMD=          # reachability seam: a shell command whose exit 0 means the API answers; unset probes ANTHROPIC_BASE_URL or the public API with curl (docs/watcher-continuity.md)

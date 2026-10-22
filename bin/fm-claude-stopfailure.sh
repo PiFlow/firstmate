@@ -24,8 +24,7 @@
 #     calling StopFailure output ignored.
 #   - No loop: state/.claude-stopfailure-episode counts the rewakes this
 #     hook delivered since the last clean Stop. Each rewake waits twice as long as
-#     the one before, and an episode that reaches FM_STOPFAILURE_MAX_REWAKES stops
-#     rewaking and alerts instead. A clean Stop by the owning session (the
+#     the one before, up to the backoff cap. A clean Stop by the owning session (the
 #     auto-arm removes the record) ends the episode and makes a still-waiting
 #     hook stand down, and a newer StopFailure supersedes an older waiting one by
 #     taking the next generation.
@@ -45,7 +44,6 @@
 #   FM_GUARD_GRACE                 seconds before an unrecovered episode alerts
 #   FM_STOPFAILURE_BACKOFF_BASE    first backoff in seconds (default 10)
 #   FM_STOPFAILURE_BACKOFF_CAP     longest backoff in seconds (default 300)
-#   FM_STOPFAILURE_MAX_REWAKES     rewakes per episode before alert only (default 5)
 #   FM_STOPFAILURE_MAX_WAIT        seconds one firing waits before standing down,
 #                                  below the registered hook timeout (default 28000)
 #   FM_STOPFAILURE_REALERT_SECS    minimum seconds between alerts (default 3600)
@@ -110,7 +108,6 @@ num_env() {
 }
 BACKOFF_BASE=$(num_env FM_STOPFAILURE_BACKOFF_BASE 10)
 BACKOFF_CAP=$(num_env FM_STOPFAILURE_BACKOFF_CAP 300)
-MAX_REWAKES=$(num_env FM_STOPFAILURE_MAX_REWAKES 5)
 MAX_WAIT=$(num_env FM_STOPFAILURE_MAX_WAIT 28000)
 REALERT_SECS=$(num_env FM_STOPFAILURE_REALERT_SECS 3600)
 
@@ -135,9 +132,17 @@ fm_hook_payload_is_pi_code "$PAYLOAD" && exit 0
 
 # --- scope and identity: the auto-arm's gates ---------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
-fm_session_lock_owned_by_self "$STATE" || exit 0
 [ -e "$STATE/.afk" ] && exit 0
 fm_supervision_needed "$STATE" "$GRACE" || exit 0
+
+ensure_session_owner() {
+  fm_session_lock_owned_by_self "$STATE" && return 0
+  fm_session_lock_inspect "$STATE"
+  [ "$FM_LOCK_INSPECT_STATE" = stale ] || return 1
+  "$SCRIPT_DIR/fm-lock.sh" >/dev/null 2>&1 || return 1
+  fm_session_lock_owned_by_self "$STATE"
+}
+ensure_session_owner || exit 0
 if fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"; then
   exit 0
 fi
@@ -214,7 +219,7 @@ still_owner() {
 still_needed() {
   still_owner || return 1
   [ ! -e "$STATE/.afk" ] || return 1
-  fm_session_lock_owned_by_self "$STATE" || return 1
+  ensure_session_owner || return 1
   fm_supervision_needed "$STATE" "$GRACE" || return 1
   ! fm_watcher_healthy "$STATE" "$SCRIPT_DIR/fm-watch.sh" "$GRACE" "$FM_HOME"
 }
@@ -249,7 +254,7 @@ raise_alert() {  # <reason>
 # normal reply); no response, a timeout, or a 5xx does not. A provider whose
 # endpoint this hook cannot name (Bedrock, Vertex, Foundry), or a host without
 # curl, cannot be probed, so it counts as reachable and the bounded backoff and
-# rewake cap alone pace recovery.
+# backoff alone paces recovery.
 api_reachable() {
   local base code
   if [ -n "${FM_STOPFAILURE_PROBE_CMD:-}" ]; then
@@ -271,10 +276,6 @@ api_reachable() {
 # --- immediate cases ----------------------------------------------------------------
 if [ "$NEEDS_HUMAN" -eq 1 ]; then
   raise_alert "the error needs the captain (waiting cannot fix it)"
-  exit 0
-fi
-if [ "$ATTEMPTS" -ge "$MAX_REWAKES" ]; then
-  raise_alert "$ATTEMPTS automatic resumes ended in API errors again"
   exit 0
 fi
 
@@ -315,14 +316,32 @@ while :; do
   fi
   nap_until "$WAKE_AT" || exit 0
   [ $(( $(date +%s) - START )) -lt "$MAX_WAIT" ] || exit 0
+  if [ "$(date +%s)" -ge "$ALERT_AT" ]; then
+    raise_alert "the session did not recover within ${GRACE}s of the API error"
+  fi
   if api_reachable; then
     still_needed || exit 0
     episode_update $((ATTEMPTS + 1)) "$ALERTED" || exit 0
-    log "rewake: API reachable after error=$ERROR_TYPE (rewake $ATTEMPTS of $MAX_REWAKES)"
+    log "rewake: API reachable after error=$ERROR_TYPE (rewake $ATTEMPTS)"
     {
       printf 'firstmate Claude turn ended on an API error (%s) while supervision was needed, and the API answers again - this wake resumes the home.\n' "$ERROR_TYPE"
       printf 'Run bin/fm-wake-drain.sh first, handle every queued wake, then run its exact WAKE_ACK_REQUIRED --ack-through command. This turn ending arms the next needed cycle through the Stop hook - do NOT run bin/fm-watch-arm.sh.\n'
     } >&2
+    if [ "$ALERTED" -eq 0 ]; then
+      if [ "$(date +%s)" -ge "$ALERT_AT" ]; then
+        raise_alert "the session did not recover within ${GRACE}s of the API error"
+      else
+        DEADLINE_ANCESTRY=$(fm_harness_ancestry_pids) || exit 0
+        (
+          trap '' HUP
+          fm_harness_ancestry_pids() { printf '%s\n' "$DEADLINE_ANCESTRY"; }
+          nap_until "$ALERT_AT" || exit 0
+          still_needed || exit 0
+          raise_alert "the session did not recover within ${GRACE}s of the API error"
+        ) </dev/null >/dev/null 2>&1 &
+        disown "$!"
+      fi
+    fi
     exit 2
   fi
   # Still down: keep the captain informed at the rate limit, then back off.

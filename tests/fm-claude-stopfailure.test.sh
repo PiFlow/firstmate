@@ -80,6 +80,13 @@ run_sf() {  # <dir> [payload]
       "${@:3}" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stopfailure.sh"
+        result=$?
+        case "${FM_TEST_CANCEL:-}" in
+          stop) rm -f "$FM_HOME/state/.claude-stopfailure-episode" ;;
+          newer) sed "s/^gen=.*/gen=99/" "$FM_HOME/state/.claude-stopfailure-episode" > "$FM_HOME/state/new-episode"; mv "$FM_HOME/state/new-episode" "$FM_HOME/state/.claude-stopfailure-episode" ;;
+        esac
+        sleep "${FM_TEST_HOLD:-0}"
+        exit "$result"
       ' > "$dir/out" 2>&1 || rc=$?
   printf '%s\n' "$rc"
 }
@@ -245,20 +252,58 @@ test_credential_failure_alerts_at_once_without_a_rewake() {
 
 # --- no loop ----------------------------------------------------------------------------
 
-test_rewake_cap_turns_a_failing_loop_into_an_alert() {
+test_repeated_failures_keep_rewaking_with_capped_backoff() {
   local dir rc n
-  dir=$(make_home "$TMP_ROOT/cap")
+  dir=$(make_home "$TMP_ROOT/repeated")
   write_probe "$dir" up
-  for n in 1 2; do
-    rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_STOPFAILURE_MAX_REWAKES=2)
-    expect_code 2 "$rc" "rewake $n of the episode"
+  for n in 1 2 3 4 5 6; do
+    rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3)
+    expect_code 2 "$rc" "rewake $n must remain possible"
   done
-  [ "$(alert_count "$dir")" = 0 ] || fail "alerted before the cap"
-  rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_STOPFAILURE_MAX_REWAKES=2)
-  expect_code 0 "$rc" "the capped episode must stop rewaking"
-  [ "$(alert_count "$dir")" = 2 ] || fail "the capped episode must alert, got: $(cat "$dir/alerts.log" 2>/dev/null)"
-  [ "$(episode_get "$dir" attempts)" = 2 ] || fail "the cap must not count a third rewake"
-  pass "stopfailure: repeated API-error handling turns stop rewaking and alert"
+  [ "$(episode_get "$dir" attempts)" = 6 ] || fail "recovery stopped after repeated failures"
+  [ "$(alert_count "$dir")" = 2 ] || fail "repeated failures must alert at the rate limit"
+  pass "stopfailure: repeated failures keep recovering and alert at the rate limit"
+}
+
+test_rewake_preserves_the_original_alert_deadline() {
+  local dir rc
+  dir=$(make_home "$TMP_ROOT/deadline")
+  write_probe "$dir" up
+  rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_TEST_HOLD=5)
+  expect_code 2 "$rc" "reachable API must rewake"
+  [ "$(alert_count "$dir")" = 2 ] || fail "rewake without a watcher must alert at the original deadline"
+  local cancel
+  for cancel in stop newer; do
+    dir=$(make_home "$TMP_ROOT/deadline-$cancel")
+    write_probe "$dir" up
+    rc=$(run_sf "$dir" "$PAYLOAD_DEFAULT" env FM_GUARD_GRACE=3 FM_TEST_HOLD=5 FM_TEST_CANCEL="$cancel")
+    expect_code 2 "$rc" "reachable API must rewake before cancellation"
+    [ "$(alert_count "$dir")" = 0 ] || fail "$cancel must supersede the detached deadline"
+  done
+  pass "stopfailure: original deadline alerts unless Stop or a newer firing supersedes it"
+}
+
+test_reclaims_stale_lock_at_entry_and_during_wait() {
+  local dir rc
+  dir=$(make_home "$TMP_ROOT/stale")
+  write_probe "$dir" flip
+  rc=0
+  printf '%s\n' "$PAYLOAD_DEFAULT" | FM_HOME="$dir" FM_WEDGE_ALARM_LOG="$dir/alerts.log" \
+    FM_STOPFAILURE_PROBE_CMD="$(cat "$dir/probe.cmd")" "$FAKE_CLAUDE" -c '
+      sleep 0.01 &
+      stale=$!
+      wait "$stale"
+      printf "%s\n" "$stale" > "$FM_HOME/state/.lock"
+      (
+        while [ ! -e "$FM_HOME/state/.claude-stopfailure-episode" ]; do sleep 0.1; done
+        printf "%s\n" "$stale" > "$FM_HOME/state/.lock"
+        touch "$FM_HOME/state/probe-up"
+      ) &
+      "$FM_HOME/bin/fm-claude-stopfailure.sh"
+    ' > "$dir/out" 2>&1 || rc=$?
+  expect_code 2 "$rc" "stale ownership must be reclaimed at both checks"
+  [ "$(episode_get "$dir" attempts)" = 1 ] || fail "stale owner blocked recovery"
+  pass "stopfailure: stale locks at entry and during recovery are reclaimed"
 }
 
 test_clean_stop_ends_the_episode_and_a_waiting_hook_stands_down() {
@@ -306,9 +351,9 @@ test_a_new_session_starts_a_new_episode() {
   write_probe "$dir" up
   printf 'session=other-session\nfirst=1\nattempts=9\nalerted=1\ngen=7\n' > "$dir/state/.claude-stopfailure-episode"
   rc=$(run_sf "$dir")
-  expect_code 2 "$rc" "a record from another session must not cap this session"
+  expect_code 2 "$rc" "a record from another session must not affect this session"
   [ "$(episode_get "$dir" attempts)" = 1 ] || fail "stale session record leaked into the new episode"
-  pass "stopfailure: an episode record from another session never caps a new one"
+  pass "stopfailure: an episode record from another session never affects a new one"
 }
 
 test_inert_in_child_worktree
@@ -321,7 +366,9 @@ test_waits_for_the_api_before_rewaking
 test_unrecovered_episode_alerts_once_on_every_channel_then_recovers
 test_never_recovering_api_alerts_and_stands_down_without_rewaking
 test_credential_failure_alerts_at_once_without_a_rewake
-test_rewake_cap_turns_a_failing_loop_into_an_alert
+test_repeated_failures_keep_rewaking_with_capped_backoff
+test_rewake_preserves_the_original_alert_deadline
+test_reclaims_stale_lock_at_entry_and_during_wait
 test_clean_stop_ends_the_episode_and_a_waiting_hook_stands_down
 test_newer_failure_supersedes_the_waiting_hook
 test_a_new_session_starts_a_new_episode

@@ -134,13 +134,14 @@ Its header owns the exact thresholds and tunables.
 
 - Recovery: it backs off, probes the API endpoint with one HTTP request (never a model request), and exits 2 once the endpoint answers.
   The rewake handling turn drains the queue, and its ordinary `Stop` re-arms through the auto-arm, which stays the only arm owner.
-  A provider whose endpoint the hook cannot name, or a host without `curl`, counts as reachable, so only the backoff and the rewake cap pace recovery.
-- No loop: `state/.claude-stopfailure-episode` counts the rewakes delivered since the last clean Stop, doubling the backoff each time.
-  At `FM_STOPFAILURE_MAX_REWAKES` it stops rewaking and alerts.
+  A provider whose endpoint the hook cannot name, or a host without `curl`, counts as reachable, so the capped backoff paces recovery.
+- Backoff: `state/.claude-stopfailure-episode` counts the rewakes delivered since the last clean Stop, doubling the backoff each time.
+  Backoff grows up to its cap; failed handling turns never exhaust recovery.
   A clean Stop by the owning session removes the record, which ends the episode and makes a still-waiting hook stand down, and a newer `StopFailure` supersedes an older waiting one.
 - Alert: an episode that has gone `FM_GUARD_GRACE` seconds without a clean Stop, or whose error needs a human (`authentication_failed`, `billing_error`), publishes the typed `downtime` recovery episode above and raises one active alert through the [`config/wedge-alarm`](wedge-alarm.md) channels, repeated at most once per `FM_STOPFAILURE_REALERT_SECS`.
   The next drain then presents WATCHER DOWN.
-  So within `FM_GUARD_GRACE` of an eligible `StopFailure`, either the session has been rewoken to re-arm or the captain has been alerted.
+  So within `FM_GUARD_GRACE` of an eligible `StopFailure`, either a live identity-matched watcher with an independently viable owner exists or the captain receives the active alert.
+  A rewake before that deadline leaves an alert-only check until the original deadline; a clean Stop or newer StopFailure supersedes it.
 
 ### Supervision host
 
@@ -534,7 +535,7 @@ It also covers generation-claim single-flight, stuck-claim supersession, superse
 3. Completes two tokenless cycles.
 4. Checks the competing-live-owner negative control.
 
-`tests/fm-claude-stopfailure.test.sh` covers the StopFailure hook's gates, backoff and reachability wait, rewake banner, alert-once rate limit, immediate credential alert, rewake cap, clean-Stop stand-down, and newer-firing supersession.
+`tests/fm-claude-stopfailure.test.sh` covers the StopFailure hook's gates, backoff and reachability wait, rewake banner, alert-once rate limit, immediate credential alert, continued recovery beyond repeated failures, clean-Stop stand-down, and newer-firing supersession.
 `tests/fm-claude-stopfailure-live-e2e.test.sh` drives the real tracked registration in an interactive session against a local stub endpoint, sends no message after the launch prompt, and covers both the recovery and the alert outcome.
 It spends no model tokens, so it runs by default wherever `claude`, `tmux`, and `python3` are installed.
 
