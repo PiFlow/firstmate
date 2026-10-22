@@ -77,7 +77,7 @@ Spawn's worktree discovery reads the foreground cwd, which follows the nested su
 Agent state is recovery-grade: a verified harness anywhere in the foreground process or its ancestors reads `alive`, a shell foreground with no harness above it reads `dead`, an exited terminal child reads `dead`, anything else reads `ambiguous`, a structured not-found reads `missing`, and an unreachable server reads `unreadable`.
 Passive reads never start a server.
 
-Rex records Program Status Protocol (OSC 7501) reports per block; Claude Code, Codex, Grok, and Muse report there today, while OpenCode, Pi, and Devin do not ([verification](verification/runtime-backends.md#worker-tools-on-rex)).
+Rex records Program Status Protocol (OSC 7501) reports per block; [worker-tool verification](verification/runtime-backends.md#worker-tools-on-rex) owns the versioned reporting coverage.
 A record counts only while the process that reported it is the foreground process or one of its ancestors, because without shell integration a `working` record outlives the command that reported it.
 That native state is positive busy evidence only, exactly like Herdr's, so the harness's own lifecycle stays the busy authority.
 
@@ -85,16 +85,16 @@ That native state is positive busy evidence only, exactly like Herdr's, so the h
 
 While the watcher waits between polls, a Rex home runs one bounded `rex do` reader ([`bin/backends/rex-eventwait.lua`](../bin/backends/rex-eventwait.lua)) on the session holding its task tabs, listening only to those tasks' blocks.
 The reader subscribes first and the current program status of each block is reconciled after, so a block that went `blocked` between waits is reported once and an edge during the reconcile is not lost.
-A `blocked` program status reaches the supervisor within a fraction of a second instead of waiting for the stale-pane timer.
+A trusted `blocked` program status takes the immediate escalation path instead of waiting for the stale-pane timer; [push verification](verification/runtime-backends.md#push-events) records measured latency.
 It counts only when the process that reported it passes the same foreground-chain rule as native busy state, and its wake reason carries Rex's blocked kind (`permission`, `question`, or `auth`) and the program's message, cut at 160 characters.
-[`bin/fm-transition-lib.sh`](../bin/fm-transition-lib.sh) owns the policy and the per-block dedupe: one wake per `blocked` edge, cleared by the next `working` edge or by the task's cleanup.
+[`bin/fm-transition-lib.sh`](../bin/fm-transition-lib.sh) owns the shared policy and per-block escalation dedupe contract.
 The watcher skips secondmate endpoints, declared waits, and captain-held work exactly as it does for Herdr's push path.
 
 When a watched block's program exits or the block closes, the wait ends at once so the watcher's next poll reconciles that task immediately.
 That never wakes the supervisor by itself, because a routine cleanup closes blocks too.
 
 The push path only shortens latency, and polling stays the fallback.
-Supervision polls when the CLI or server is below API revision 5 or unreachable (the reader never starts a server), when the reader cannot start or ends before its deadline, and for the rest of the watcher's life after three consecutive reader failures.
+Supervision polls when the CLI or server is below API revision 5 or unreachable (the reader never starts a server), when the reader cannot start or ends before its deadline, and after the watcher's consecutive-reader-failure threshold is reached (three by default).
 Task tabs in a second Rex session stay on polling, because one reader covers one session.
 
 ## Cleanup and the absence proof
@@ -141,5 +141,5 @@ tests/fm-backend-rex-eventwait-smoke.test.sh
 FM_REX_COMPOSER_LIVE=1 tests/fm-backend-rex-composer-live-e2e.test.sh
 ```
 
-The real-server tests run only against an already-running server, work only in `fm-test-` sessions they create and kill by exact id, refuse through a forwarding guard any state-changing call outside those sessions, and check that every other session is byte-identical before and after ([`tests/rex-test-safety.sh`](../tests/rex-test-safety.sh)).
+The real-server isolation contract is owned by [`tests/rex-test-safety.sh`](../tests/rex-test-safety.sh): an already-running server, mutations confined to the tests' own `fm-test-` sessions, and unchanged ids and labels in every other session's structural snapshot.
 [`verification/runtime-backends.md`](verification/runtime-backends.md#rex) records the live evidence.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Shared, backend-neutral agent-state transition shape and supervision policy.
 #
-# This library owns TWO contracts, deliberately backend-independent so any
-# push-capable session backend (herdr today, others later) reuses them instead
+# This library owns THREE contracts, deliberately backend-independent so any
+# push-capable session backend (herdr and rex today) reuses them instead
 # of re-deriving a private, per-status escalation hack:
 #
 #   1. The NORMALIZED TRANSITION RECORD - the ONE shape every backend's event
